@@ -8,31 +8,31 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, MessageEntity
 from aiogram.filters import CommandStart, Command
 from dotenv import load_dotenv
-from aiohttp import web  # мини-веб для health-check / keep-alive
+from aiohttp import web  # health-check / keep-alive
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-# --- приоритеты для корректной вложенности (внешние меньше)
+# --- приоритеты для корректной вложенности (меньше = "внешнее")
 TAG_PRIORITY = {
     "blockquote": -10,
     "text_link": 0, "text_mention": 0, "url": 0, "email": 0, "mention": 0,  # ссылки — внешние
-    "bold": 10, "italic": 11, "underline": 12, "strikethrough": 13, "spoiler": 14,
-    "code": 20, "pre": 21,  # моноширинные — наиболее внутренние
+    "bold": 10, "italic": 11, "underline": 12, "strikethrough": 13,
+    "spoiler": 14,
+    "code": 20, "pre": 21,  # моноширинные — самые внутренние
 }
 DEFAULT_PRIORITY = 15
+
+# типы, которые можно "склеивать" через пробелы
+MERGEABLE = {"bold", "italic", "underline", "strikethrough"}
 
 def etype_str(e: MessageEntity) -> str:
     return e.type.value if hasattr(e.type, "value") else str(e.type)
 
 # --- КЛЮЧЕВОЕ: перевод позиции из UTF-16 code units в индекс Python-строки
 def utf16_units_to_py_index(s: str, unit_pos: int) -> int:
-    """
-    Возвращает индекс в Python-строке, соответствующий позиции unit_pos в UTF-16 code units.
-    Эмодзи/символы вне BMP занимают 2 юнита, обычные — 1.
-    """
     if unit_pos <= 0:
         return 0
     u = 0
@@ -42,67 +42,125 @@ def utf16_units_to_py_index(s: str, unit_pos: int) -> int:
         cp = ord(s[i])
         u += 2 if cp > 0xFFFF else 1
         i += 1
-    return i  # может быть == len(s), что нормально для концов выделений
+    return i
 
-def entity_tags(entity: MessageEntity, text: str, start_py: int, end_py: int):
-    """Подбираем открывающий/закрывающий тег и (при необходимости) собираем href из подстроки."""
-    etype = etype_str(entity)
-    substr = text[start_py:end_py]
-
-    if etype == "bold":            return "<b>", "</b>", etype
-    if etype == "italic":          return "<i>", "</i>", etype
-    if etype == "underline":       return "<u>", "</u>", etype
-    if etype == "strikethrough":   return "<s>", "</s>", etype
-    if etype == "spoiler":         return '<span class="tg-spoiler">', "</span>", etype
-    if etype == "code":            return "<code>", "</code>", etype
-    if etype == "pre":
-        lang = getattr(entity, "language", None)
-        if lang:                   return f'<pre><code class="language-{html_escape(lang)}">', "</code></pre>", etype
-        return "<pre>", "</pre>", etype
-    if etype == "text_link" and getattr(entity, "url", None):
-        return f'<a href="{html_escape(entity.url)}">', "</a>", etype
-    if etype == "text_mention" and getattr(entity, "user", None):
-        return f'<a href="tg://user?id={entity.user.id}">', "</a>", etype
-    if etype == "url":             return f'<a href="{html_escape(substr)}">', "</a>", etype
-    if etype == "email":           return f'<a href="mailto:{html_escape(substr)}">', "</a>", etype
-    if etype == "mention":
-        username = substr[1:] if substr.startswith("@") else substr
-        return f'<a href="https://t.me/{html_escape(username)}">', "</a>", etype
-    if etype == "blockquote":      return "<blockquote>", "</blockquote>", etype
-    return None, None, etype
+def basic_tags_for_type(etype: str, *, href: str | None = None, user_id: int | None = None):
+    if etype == "bold":          return "<b>", "</b>"
+    if etype == "italic":        return "<i>", "</i>"
+    if etype == "underline":     return "<u>", "</u>"
+    if etype == "strikethrough": return "<s>", "</s>"
+    if etype == "spoiler":       return '<span class="tg-spoiler">', "</span>"
+    if etype == "code":          return "<code>", "</code>"
+    if etype == "pre":           return "<pre>", "</pre>"
+    if etype == "text_link" and href:
+        return f'<a href="{html_escape(href)}">', "</a>"
+    if etype == "text_mention" and user_id:
+        return f'<a href="tg://user?id={user_id}">', "</a>"
+    if etype == "url" and href:
+        return f'<a href="{html_escape(href)}">', "</a>"
+    if etype == "email" and href:
+        return f'<a href="mailto:{html_escape(href)}">', "</a>"
+    if etype == "mention" and href:
+        return f'<a href="https://t.me/{html_escape(href)}">', "</a>"
+    if etype == "blockquote":    return "<blockquote>", "</blockquote>"
+    return None, None
 
 def tag_priority(etype: str) -> int:
     return TAG_PRIORITY.get(etype, DEFAULT_PRIORITY)
 
-def to_telegram_html(text: str, entities: list[MessageEntity] | None) -> str:
-    """
-    Собирает валидную HTML-вложенность.
-    ВАЖНО: конвертирует offsets из UTF-16 units в индексы Python.
-    """
-    if not text:
-        return ""
+def build_raw_spans(text: str, entities: list[MessageEntity] | None):
+    """Готовим «сырые» интервалы с учётом UTF-16 → Python."""
+    if not entities:
+        return []
 
-    entities = entities or []
-    starts = defaultdict(list)  # pos_py -> list[(key1, key2, open_tag)]
-    ends   = defaultdict(list)  # pos_py -> list[(key1, key2, close_tag)]
-
+    spans = []
     for e in entities:
-        # Telegram даёт offset/length в UTF-16 units
-        start_py = utf16_units_to_py_index(text, e.offset)
-        end_py   = utf16_units_to_py_index(text, e.offset + e.length)
+        etype = etype_str(e)
+        start = utf16_units_to_py_index(text, e.offset)
+        end   = utf16_units_to_py_index(text, e.offset + e.length)
 
-        open_tag, close_tag, etype = entity_tags(e, text, start_py, end_py)
+        # подготовим доп.данные для ссылочных
+        href = None
+        user_id = None
+        if etype == "text_link" and getattr(e, "url", None):
+            href = e.url
+        elif etype == "text_mention" and getattr(e, "user", None):
+            user_id = e.user.id
+        elif etype == "url":
+            href = text[start:end]
+        elif etype == "email":
+            href = f"mailto:{text[start:end]}"
+        elif etype == "mention":
+            username = text[start:end]
+            if username.startswith("@"):
+                username = username[1:]
+            href = username
+
+        # пропускаем полностью пробельные участки для mergeable-типов
+        if etype in MERGEABLE and text[start:end].strip() == "":
+            continue
+
+        open_tag, close_tag = basic_tags_for_type(etype, href=href, user_id=user_id)
         if not open_tag:
             continue
 
-        length_py = end_py - start_py
-        pr = tag_priority(etype)
+        spans.append({
+            "type": etype,
+            "start": start,
+            "end": end,
+            "open": open_tag,
+            "close": close_tag,
+            "priority": tag_priority(etype),
+        })
+    return spans
 
-        # Открывать внешние раньше (длиннее / меньший pr), закрывать внутренние раньше
-        starts[start_py].append((-length_py, pr, open_tag))
-        ends[end_py].append((length_py, -pr, close_tag))
+def merge_mergeable_spans(text: str, spans: list[dict]) -> list[dict]:
+    """Склеиваем соседние MERGEABLE-участки одного типа, если между ними только пробелы."""
+    by_type = {t: [] for t in MERGEABLE}
+    others = []
+    for s in spans:
+        (by_type if s["type"] in MERGEABLE else others)[s["type"] if s["type"] in MERGEABLE else "others"].append(s)
 
-    # сортировки
+    merged = []
+    # склейка для каждого mergeable-типа отдельно
+    for t in MERGEABLE:
+        arr = by_type[t]
+        if not arr:
+            continue
+        arr.sort(key=lambda x: (x["start"], x["end"]))
+        cur = arr[0]
+        for nxt in arr[1:]:
+            gap = text[cur["end"]:nxt["start"]]
+            if gap != "" and not gap.isspace():
+                # между ними не только пробелы — не трогаем
+                merged.append(cur)
+                cur = nxt
+                continue
+            # только пробелы → в общую обёртку; включаем и сами пробелы
+            cur["end"] = nxt["end"]
+        merged.append(cur)
+
+    return merged + others
+
+def to_telegram_html(text: str, entities: list[MessageEntity] | None) -> str:
+    if not text:
+        return ""
+
+    # 1) Сырые интервалы (UTF-16→Py) + отбрасывание "пустых" пробельных
+    raw = build_raw_spans(text, entities)
+
+    # 2) Склейка <b>/<i>/<u>/<s> через пробелы
+    spans = merge_mergeable_spans(text, raw)
+
+    # 3) Готовим события открытий/закрытий с правильной вложенностью
+    starts = defaultdict(list)
+    ends   = defaultdict(list)
+    for s in spans:
+        length = s["end"] - s["start"]
+        pr = s["priority"]
+        starts[s["start"]].append((-length, pr, s["open"]))
+        ends[s["end"]].append((length, -pr, s["close"]))
+
     for pos in starts: starts[pos].sort()
     for pos in ends:   ends[pos].sort()
 
@@ -119,14 +177,14 @@ def to_telegram_html(text: str, entities: list[MessageEntity] | None) -> str:
             out.append(html_escape(text[i]))
     return "".join(out)
 
-# --- health-check endpoint (для рендер/пингов)
-async def _health(request):  # GET /
+# --- health-check для Render / UptimeRobot
+async def _health(request):
     return web.Response(text="ok")
 
 async def start_keepalive_server():
     app = web.Application()
     app.router.add_get("/", _health)
-    port = int(os.getenv("PORT", "10000"))  # Render кладёт порт в переменную PORT
+    port = int(os.getenv("PORT", "10000"))  # Render задаёт порт в переменной PORT
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
@@ -137,7 +195,7 @@ async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не найден в переменных окружения")
 
-    bot = Bot(BOT_TOKEN, parse_mode=None)  # отправляем «сырой» HTML-код
+    bot = Bot(BOT_TOKEN, parse_mode=None)  # присылаем «сырой» HTML
     dp  = Dispatcher()
 
     @dp.message(CommandStart())
