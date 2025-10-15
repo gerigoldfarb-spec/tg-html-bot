@@ -24,14 +24,12 @@ TAG_PRIORITY = {
     "code": 20, "pre": 21,  # моноширинные — самые внутренние
 }
 DEFAULT_PRIORITY = 15
-
-# типы, которые можно склеивать через пробелы
 MERGEABLE = {"bold", "italic", "underline", "strikethrough"}
 
 def etype_str(e: MessageEntity) -> str:
     return e.type.value if hasattr(e.type, "value") else str(e.type)
 
-# --- КЛЮЧЕВОЕ: перевод позиции из UTF-16 code units в индекс Python-строки
+# UTF-16 code units -> индекс Python
 def utf16_units_to_py_index(s: str, unit_pos: int) -> int:
     if unit_pos <= 0:
         return 0
@@ -69,39 +67,36 @@ def tag_priority(etype: str) -> int:
     return TAG_PRIORITY.get(etype, DEFAULT_PRIORITY)
 
 def build_raw_spans(text: str, entities: list[MessageEntity] | None):
-    """Готовим «сырые» интервалы с учётом UTF-16 → Python."""
     if not entities:
         return []
-
     spans = []
     for e in entities:
         etype = etype_str(e)
         start = utf16_units_to_py_index(text, e.offset)
         end   = utf16_units_to_py_index(text, e.offset + e.length)
-
-        # подстраховка от разъехавшихся границ
         if start >= end or start < 0 or end > len(text):
             continue
 
-        # подготовим доп.данные для ссылочных
+        # подготовка href/username + очистка whitespace
         href = None
         user_id = None
+        substr = text[start:end]
         if etype == "text_link" and getattr(e, "url", None):
             href = e.url
         elif etype == "text_mention" and getattr(e, "user", None):
             user_id = e.user.id
         elif etype == "url":
-            href = text[start:end]
+            href = "".join(substr.split())  # убираем переносы/пробелы
         elif etype == "email":
-            href = text[start:end]
+            href = "".join(substr.split())
         elif etype == "mention":
-            username = text[start:end]
+            username = substr.strip()
             if username.startswith("@"):
                 username = username[1:]
             href = username
 
-        # пропускаем полностью пробельные участки для mergeable-типов (убирает <b> </b>)
-        if etype in MERGEABLE and text[start:end].strip() == "":
+        # выкидываем полностью пробельные куски для mergeable-типов (убирает <b> </b>)
+        if etype in MERGEABLE and substr.strip() == "":
             continue
 
         open_tag, close_tag = basic_tags_for_type(etype, href=href, user_id=user_id)
@@ -109,6 +104,7 @@ def build_raw_spans(text: str, entities: list[MessageEntity] | None):
             continue
 
         spans.append({
+            "id": id(e),                   # уникальный идентификатор
             "type": etype,
             "start": start,
             "end": end,
@@ -119,9 +115,13 @@ def build_raw_spans(text: str, entities: list[MessageEntity] | None):
     return spans
 
 def merge_mergeable_spans(text: str, spans: list[dict]) -> list[dict]:
-    """Склеиваем соседние MERGEABLE-участки одного типа, если между ними только пробелы."""
     by_type: dict[str, list[dict]] = {t: [] for t in MERGEABLE}
     others: list[dict] = []
+    for s in spans:
+        (by_type if s["type"] in MERGEABLE else others).setdefault(s["type"] if s["type"] in MERGEABLE else "others", []).append(s)
+    # ↑ setdefault нужен потому, что others — не dict по типам; исправим на явное разделение:
+    by_type = {t: [] for t in MERGEABLE}
+    others = []
     for s in spans:
         if s["type"] in MERGEABLE:
             by_type[s["type"]].append(s)
@@ -141,55 +141,86 @@ def merge_mergeable_spans(text: str, spans: list[dict]) -> list[dict]:
                 merged.append(cur)
                 cur = nxt
             else:
-                # только пробелы → объединяем (включая сами пробелы)
-                cur["end"] = nxt["end"]
+                cur["end"] = max(cur["end"], nxt["end"])  # включаем пробелы и сливаем
         merged.append(cur)
-
     return merged + others
 
 def to_telegram_html(text: str, entities: list[MessageEntity] | None) -> str:
     if not text:
         return ""
 
-    # 1) Сырые интервалы (UTF-16→Py) + отбрасывание "пустых" пробельных
-    raw = build_raw_spans(text, entities)
+    # сырые интервалы + фиксы
+    spans = merge_mergeable_spans(text, build_raw_spans(text, entities))
 
-    # 2) Склейка <b>/<i>/<u>/<s> через пробелы
-    spans = merge_mergeable_spans(text, raw)
-
-    # 3) Готовим события открытий/закрытий с правильной вложенностью
-    starts = defaultdict(list)
+    # индексы старт/финиш
+    starts = defaultdict(list)  # pos -> [(sort_key, span_id)]
     ends   = defaultdict(list)
+    by_id  = {}
+
     for s in spans:
+        by_id[s["id"]] = s
         length = s["end"] - s["start"]
         pr = s["priority"]
-        starts[s["start"]].append((-length, pr, s["open"]))   # внешние раньше
-        ends[s["end"]].append((length, -pr, s["close"]))      # внутренние раньше
+        starts[s["start"]].append(((-length, pr), s["id"]))   # внешние раньше
+        ends[s["end"]].append(((length, -pr), s["id"]))       # внутренние раньше
 
     for pos in starts: starts[pos].sort()
     for pos in ends:   ends[pos].sort()
 
     out = []
+    open_stack: list[int] = []  # stack of span_ids
     n = len(text)
+
+    def close_until(span_id: int):
+        """Закрыть всё сверху до указанного span_id, закрыть его, затем переоткрыть снятые."""
+        reopen = []
+        while open_stack and open_stack[-1] != span_id:
+            sid = open_stack.pop()
+            out.append(by_id[sid]["close"])
+            reopen.append(sid)
+        if open_stack and open_stack[-1] == span_id:
+            open_stack.pop()
+            out.append(by_id[span_id]["close"])
+        for sid in reversed(reopen):
+            out.append(by_id[sid]["open"])
+            open_stack.append(sid)
+
     for i in range(n + 1):
+        # закрытия на позиции i — по глубине в текущем стеке (самые глубокие сперва)
         if i in ends:
-            for _, _, tag in ends[i]:
-                out.append(tag)
+            to_close = [sid for _, sid in ends[i]]
+            while to_close:
+                # берём тот, что глубже всех в стеке
+                idx_sid = [(open_stack.index(sid), sid) for sid in to_close if sid in open_stack]
+                if not idx_sid:
+                    break
+                _, deepest = max(idx_sid, key=lambda x: x[0])
+                close_until(deepest)
+                to_close.remove(deepest)
+
+        # открытия на позиции i — по нашему сортировочному ключу
         if i in starts:
-            for _, _, tag in starts[i]:
-                out.append(tag)
+            for _, sid in starts[i]:
+                out.append(by_id[sid]["open"])
+                open_stack.append(sid)
+
         if i < n:
             out.append(html_escape(text[i]))
+
+    # на всякий случай закрываем то, что осталось (не должно, но безопасно)
+    while open_stack:
+        out.append(by_id[open_stack.pop()]["close"])
+
     return "".join(out)
 
-# --- health-check для Render / UptimeRobot
+# --- health-check
 async def _health(request):
     return web.Response(text="ok")
 
 async def start_keepalive_server():
     app = web.Application()
     app.router.add_get("/", _health)
-    port = int(os.getenv("PORT", "10000"))  # Render задаёт порт в переменной PORT
+    port = int(os.getenv("PORT", "10000"))  # Render задаёт порт
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
@@ -200,7 +231,7 @@ async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не найден в переменных окружения")
 
-    bot = Bot(BOT_TOKEN, parse_mode=None)  # присылаем «сырой» HTML
+    bot = Bot(BOT_TOKEN, parse_mode=None)  # шлём «сырой» HTML
     dp  = Dispatcher()
 
     @dp.message(CommandStart())
