@@ -25,7 +25,7 @@ TAG_PRIORITY = {
 }
 DEFAULT_PRIORITY = 15
 
-# типы, которые можно "склеивать" через пробелы
+# типы, которые можно склеивать через пробелы
 MERGEABLE = {"bold", "italic", "underline", "strikethrough"}
 
 def etype_str(e: MessageEntity) -> str:
@@ -79,6 +79,10 @@ def build_raw_spans(text: str, entities: list[MessageEntity] | None):
         start = utf16_units_to_py_index(text, e.offset)
         end   = utf16_units_to_py_index(text, e.offset + e.length)
 
+        # подстраховка от разъехавшихся границ
+        if start >= end or start < 0 or end > len(text):
+            continue
+
         # подготовим доп.данные для ссылочных
         href = None
         user_id = None
@@ -89,14 +93,14 @@ def build_raw_spans(text: str, entities: list[MessageEntity] | None):
         elif etype == "url":
             href = text[start:end]
         elif etype == "email":
-            href = f"mailto:{text[start:end]}"
+            href = text[start:end]
         elif etype == "mention":
             username = text[start:end]
             if username.startswith("@"):
                 username = username[1:]
             href = username
 
-        # пропускаем полностью пробельные участки для mergeable-типов
+        # пропускаем полностью пробельные участки для mergeable-типов (убирает <b> </b>)
         if etype in MERGEABLE and text[start:end].strip() == "":
             continue
 
@@ -116,13 +120,15 @@ def build_raw_spans(text: str, entities: list[MessageEntity] | None):
 
 def merge_mergeable_spans(text: str, spans: list[dict]) -> list[dict]:
     """Склеиваем соседние MERGEABLE-участки одного типа, если между ними только пробелы."""
-    by_type = {t: [] for t in MERGEABLE}
-    others = []
+    by_type: dict[str, list[dict]] = {t: [] for t in MERGEABLE}
+    others: list[dict] = []
     for s in spans:
-        (by_type if s["type"] in MERGEABLE else others)[s["type"] if s["type"] in MERGEABLE else "others"].append(s)
+        if s["type"] in MERGEABLE:
+            by_type[s["type"]].append(s)
+        else:
+            others.append(s)
 
-    merged = []
-    # склейка для каждого mergeable-типа отдельно
+    merged: list[dict] = []
     for t in MERGEABLE:
         arr = by_type[t]
         if not arr:
@@ -132,12 +138,11 @@ def merge_mergeable_spans(text: str, spans: list[dict]) -> list[dict]:
         for nxt in arr[1:]:
             gap = text[cur["end"]:nxt["start"]]
             if gap != "" and not gap.isspace():
-                # между ними не только пробелы — не трогаем
                 merged.append(cur)
                 cur = nxt
-                continue
-            # только пробелы → в общую обёртку; включаем и сами пробелы
-            cur["end"] = nxt["end"]
+            else:
+                # только пробелы → объединяем (включая сами пробелы)
+                cur["end"] = nxt["end"]
         merged.append(cur)
 
     return merged + others
@@ -158,8 +163,8 @@ def to_telegram_html(text: str, entities: list[MessageEntity] | None) -> str:
     for s in spans:
         length = s["end"] - s["start"]
         pr = s["priority"]
-        starts[s["start"]].append((-length, pr, s["open"]))
-        ends[s["end"]].append((length, -pr, s["close"]))
+        starts[s["start"]].append((-length, pr, s["open"]))   # внешние раньше
+        ends[s["end"]].append((length, -pr, s["close"]))      # внутренние раньше
 
     for pos in starts: starts[pos].sort()
     for pos in ends:   ends[pos].sort()
