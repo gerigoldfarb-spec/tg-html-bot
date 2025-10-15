@@ -18,10 +18,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 # --- приоритеты для корректной вложенности (меньше = "внешнее")
 TAG_PRIORITY = {
     "blockquote": -10,
-    "text_link": 0, "text_mention": 0, "url": 0, "email": 0, "mention": 0,  # ссылки — внешние
+    "text_link": 0, "text_mention": 0, "url": 0, "email": 0, "mention": 0,
     "bold": 10, "italic": 11, "underline": 12, "strikethrough": 13,
     "spoiler": 14,
-    "code": 20, "pre": 21,  # моноширинные — самые внутренние
+    "code": 20, "pre": 21,
 }
 DEFAULT_PRIORITY = 15
 MERGEABLE = {"bold", "italic", "underline", "strikethrough"}
@@ -77,18 +77,17 @@ def build_raw_spans(text: str, entities: list[MessageEntity] | None):
         if start >= end or start < 0 or end > len(text):
             continue
 
-        # подготовка href/username + очистка whitespace
+        substr = text[start:end]
         href = None
         user_id = None
-        substr = text[start:end]
         if etype == "text_link" and getattr(e, "url", None):
             href = e.url
         elif etype == "text_mention" and getattr(e, "user", None):
             user_id = e.user.id
         elif etype == "url":
-            href = "".join(substr.split())  # убираем переносы/пробелы
+            href = "".join(substr.split())      # убираем переносы/пробелы
         elif etype == "email":
-            href = "".join(substr.split())
+            href = "".join(substr.split())      # то же для email
         elif etype == "mention":
             username = substr.strip()
             if username.startswith("@"):
@@ -104,7 +103,7 @@ def build_raw_spans(text: str, entities: list[MessageEntity] | None):
             continue
 
         spans.append({
-            "id": id(e),                   # уникальный идентификатор
+            "id": id(e),
             "type": etype,
             "start": start,
             "end": end,
@@ -115,13 +114,9 @@ def build_raw_spans(text: str, entities: list[MessageEntity] | None):
     return spans
 
 def merge_mergeable_spans(text: str, spans: list[dict]) -> list[dict]:
+    """Склеиваем соседние MERGEABLE-участки одного типа, если между ними только пробелы."""
     by_type: dict[str, list[dict]] = {t: [] for t in MERGEABLE}
     others: list[dict] = []
-    for s in spans:
-        (by_type if s["type"] in MERGEABLE else others).setdefault(s["type"] if s["type"] in MERGEABLE else "others", []).append(s)
-    # ↑ setdefault нужен потому, что others — не dict по типам; исправим на явное разделение:
-    by_type = {t: [] for t in MERGEABLE}
-    others = []
     for s in spans:
         if s["type"] in MERGEABLE:
             by_type[s["type"]].append(s)
@@ -129,30 +124,30 @@ def merge_mergeable_spans(text: str, spans: list[dict]) -> list[dict]:
             others.append(s)
 
     merged: list[dict] = []
-    for t in MERGEABLE:
-        arr = by_type[t]
+    for t, arr in by_type.items():
         if not arr:
             continue
         arr.sort(key=lambda x: (x["start"], x["end"]))
         cur = arr[0]
         for nxt in arr[1:]:
             gap = text[cur["end"]:nxt["start"]]
-            if gap != "" and not gap.isspace():
+            if gap and not gap.isspace():
                 merged.append(cur)
                 cur = nxt
             else:
-                cur["end"] = max(cur["end"], nxt["end"])  # включаем пробелы и сливаем
+                # только пробелы → объединяем (включая сами пробелы)
+                cur["end"] = max(cur["end"], nxt["end"])
         merged.append(cur)
+
     return merged + others
 
 def to_telegram_html(text: str, entities: list[MessageEntity] | None) -> str:
     if not text:
         return ""
 
-    # сырые интервалы + фиксы
     spans = merge_mergeable_spans(text, build_raw_spans(text, entities))
 
-    # индексы старт/финиш
+    # Готовим события открытий/закрытий
     starts = defaultdict(list)  # pos -> [(sort_key, span_id)]
     ends   = defaultdict(list)
     by_id  = {}
@@ -168,8 +163,7 @@ def to_telegram_html(text: str, entities: list[MessageEntity] | None) -> str:
     for pos in ends:   ends[pos].sort()
 
     out = []
-    open_stack: list[int] = []  # stack of span_ids
-    n = len(text)
+    open_stack: list[int] = []
 
     def close_until(span_id: int):
         """Закрыть всё сверху до указанного span_id, закрыть его, затем переоткрыть снятые."""
@@ -185,12 +179,12 @@ def to_telegram_html(text: str, entities: list[MessageEntity] | None) -> str:
             out.append(by_id[sid]["open"])
             open_stack.append(sid)
 
+    n = len(text)
     for i in range(n + 1):
-        # закрытия на позиции i — по глубине в текущем стеке (самые глубокие сперва)
+        # Сначала закрытия на позиции i (по текущей глубине)
         if i in ends:
             to_close = [sid for _, sid in ends[i]]
             while to_close:
-                # берём тот, что глубже всех в стеке
                 idx_sid = [(open_stack.index(sid), sid) for sid in to_close if sid in open_stack]
                 if not idx_sid:
                     break
@@ -198,16 +192,17 @@ def to_telegram_html(text: str, entities: list[MessageEntity] | None) -> str:
                 close_until(deepest)
                 to_close.remove(deepest)
 
-        # открытия на позиции i — по нашему сортировочному ключу
+        # Затем открытия
         if i in starts:
             for _, sid in starts[i]:
                 out.append(by_id[sid]["open"])
                 open_stack.append(sid)
 
+        # Текст
         if i < n:
             out.append(html_escape(text[i]))
 
-    # на всякий случай закрываем то, что осталось (не должно, но безопасно)
+    # Закрыть всё, что осталось
     while open_stack:
         out.append(by_id[open_stack.pop()]["close"])
 
