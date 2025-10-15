@@ -8,34 +8,46 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, MessageEntity
 from aiogram.filters import CommandStart, Command
 from dotenv import load_dotenv
-
-# мини-веб-сервер для проверки/пингов (Render/UptimeRobot)
-from aiohttp import web
+from aiohttp import web  # мини-веб для health-check / keep-alive
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-# --- приоритеты для корректной вложенности тегов
+# --- приоритеты для корректной вложенности (внешние меньше)
 TAG_PRIORITY = {
     "blockquote": -10,
     "text_link": 0, "text_mention": 0, "url": 0, "email": 0, "mention": 0,  # ссылки — внешние
     "bold": 10, "italic": 11, "underline": 12, "strikethrough": 13, "spoiler": 14,
-    "code": 20, "pre": 21,  # моноширинные — самые внутренние
+    "code": 20, "pre": 21,  # моноширинные — наиболее внутренние
 }
 DEFAULT_PRIORITY = 15
 
+def etype_str(e: MessageEntity) -> str:
+    return e.type.value if hasattr(e.type, "value") else str(e.type)
 
-def etype_str(entity: MessageEntity) -> str:
-    return entity.type.value if hasattr(entity.type, "value") else str(entity.type)
+# --- КЛЮЧЕВОЕ: перевод позиции из UTF-16 code units в индекс Python-строки
+def utf16_units_to_py_index(s: str, unit_pos: int) -> int:
+    """
+    Возвращает индекс в Python-строке, соответствующий позиции unit_pos в UTF-16 code units.
+    Эмодзи/символы вне BMP занимают 2 юнита, обычные — 1.
+    """
+    if unit_pos <= 0:
+        return 0
+    u = 0
+    i = 0
+    n = len(s)
+    while i < n and u < unit_pos:
+        cp = ord(s[i])
+        u += 2 if cp > 0xFFFF else 1
+        i += 1
+    return i  # может быть == len(s), что нормально для концов выделений
 
-
-def entity_tags(entity: MessageEntity, text: str):
+def entity_tags(entity: MessageEntity, text: str, start_py: int, end_py: int):
+    """Подбираем открывающий/закрывающий тег и (при необходимости) собираем href из подстроки."""
     etype = etype_str(entity)
-    start = entity.offset
-    end = entity.offset + entity.length
-    substr = text[start:end]
+    substr = text[start_py:end_py]
 
     if etype == "bold":            return "<b>", "</b>", etype
     if etype == "italic":          return "<i>", "</i>", etype
@@ -59,31 +71,38 @@ def entity_tags(entity: MessageEntity, text: str):
     if etype == "blockquote":      return "<blockquote>", "</blockquote>", etype
     return None, None, etype
 
-
 def tag_priority(etype: str) -> int:
     return TAG_PRIORITY.get(etype, DEFAULT_PRIORITY)
 
-
 def to_telegram_html(text: str, entities: list[MessageEntity] | None) -> str:
-    """Собирает валидную HTML-вложенность с учётом длин и приоритетов."""
+    """
+    Собирает валидную HTML-вложенность.
+    ВАЖНО: конвертирует offsets из UTF-16 units в индексы Python.
+    """
     if not text:
         return ""
+
     entities = entities or []
-    starts = defaultdict(list)  # pos -> list[(key1, key2, open_tag)]
-    ends = defaultdict(list)    # pos -> list[(key1, key2, close_tag)]
+    starts = defaultdict(list)  # pos_py -> list[(key1, key2, open_tag)]
+    ends   = defaultdict(list)  # pos_py -> list[(key1, key2, close_tag)]
 
     for e in entities:
-        open_tag, close_tag, etype = entity_tags(e, text)
+        # Telegram даёт offset/length в UTF-16 units
+        start_py = utf16_units_to_py_index(text, e.offset)
+        end_py   = utf16_units_to_py_index(text, e.offset + e.length)
+
+        open_tag, close_tag, etype = entity_tags(e, text, start_py, end_py)
         if not open_tag:
             continue
-        start = e.offset
-        end = e.offset + e.length
-        length = e.length
-        pr = tag_priority(etype)
-        # Открывать внешние раньше (длиннее, меньший pr), закрывать внутренние раньше
-        starts[start].append((-length, pr, open_tag))
-        ends[end].append((length, -pr, close_tag))
 
+        length_py = end_py - start_py
+        pr = tag_priority(etype)
+
+        # Открывать внешние раньше (длиннее / меньший pr), закрывать внутренние раньше
+        starts[start_py].append((-length_py, pr, open_tag))
+        ends[end_py].append((length_py, -pr, close_tag))
+
+    # сортировки
     for pos in starts: starts[pos].sort()
     for pos in ends:   ends[pos].sort()
 
@@ -100,30 +119,26 @@ def to_telegram_html(text: str, entities: list[MessageEntity] | None) -> str:
             out.append(html_escape(text[i]))
     return "".join(out)
 
-
-# --- простой web-сервер для health-check (возвращает "ok" на "/")
-async def _health(request):
+# --- health-check endpoint (для рендер/пингов)
+async def _health(request):  # GET /
     return web.Response(text="ok")
-
 
 async def start_keepalive_server():
     app = web.Application()
     app.router.add_get("/", _health)
-    # Render задаёт порт в переменной PORT — обязаны слушать его
-    port = int(os.getenv("PORT", "10000"))
+    port = int(os.getenv("PORT", "10000"))  # Render кладёт порт в переменную PORT
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logging.info(f"Keep-alive web server started on port {port}")
 
-
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не найден в переменных окружения")
 
     bot = Bot(BOT_TOKEN, parse_mode=None)  # отправляем «сырой» HTML-код
-    dp = Dispatcher()
+    dp  = Dispatcher()
 
     @dp.message(CommandStart())
     async def start_cmd(m: Message):
@@ -143,12 +158,10 @@ async def main():
         html_str = to_telegram_html(m.caption, m.caption_entities)
         await m.answer(html_str or html_escape(m.caption or ""), disable_web_page_preview=True)
 
-    # параллельно поднимаем веб-сервер и запускаем polling
     await asyncio.gather(
         start_keepalive_server(),
         dp.start_polling(bot)
     )
-
 
 if __name__ == "__main__":
     asyncio.run(main())
